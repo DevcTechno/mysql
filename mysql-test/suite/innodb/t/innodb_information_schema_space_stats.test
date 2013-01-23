@@ -1,0 +1,79 @@
+--source include/have_innodb.inc
+
+SET @old_innodb_file_per_table = @@GLOBAL.innodb_file_per_table;
+SET GLOBAL innodb_file_per_table = ON;
+
+let $MYSQL_DATA_DIR = `SELECT @@datadir`;
+
+--echo #
+--echo # Expose I/O operations counters per tablespace
+--echo #
+
+CREATE TABLE t1 (a INT PRIMARY KEY AUTO_INCREMENT, b VARCHAR(512)) ENGINE=InnoDB;
+CREATE TABLE t2 LIKE t1;
+
+INSERT INTO t1 VALUES (0, REPEAT('b', 512));
+INSERT INTO t1 SELECT 0, b FROM t1;
+INSERT INTO t2 SELECT 0, b FROM t1;
+
+--vertical_results
+
+--echo # Wait for I/O to be started (dirty pages to be flushed).
+let $wait_condition=
+  SELECT COUNT(*) = 2 FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t%' AND WRITE_BYTES = 65536;
+--source include/wait_condition.inc
+
+--echo # Display statistics.
+SELECT WRITE_REQS, WRITE_BYTES FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t%';
+
+--echo # Display tablespace names.
+SELECT SUBSTRING(SPACE_NAME, -11) AS `SPACE_NAME` FROM
+  INFORMATION_SCHEMA.INNODB_SPACE_STATS WHERE SPACE_NAME LIKE '%test/t%'
+  ORDER BY SPACE;
+
+--echo # Copy and discard tablespace so that the tablespace is completely flushed.
+--copy_file $MYSQL_DATA_DIR/test/t1.ibd $MYSQL_TMP_DIR/t1.ibd
+ALTER TABLE t1 DISCARD TABLESPACE;
+
+--echo # Check that tablespace has been removed from memory.
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t%';
+
+--echo # Copy and import tablespace.
+--copy_file $MYSQL_TMP_DIR/t1.ibd $MYSQL_DATA_DIR/test/t1.ibd
+ALTER TABLE t1 IMPORT TABLESPACE;
+
+--remove_file $MYSQL_TMP_DIR/t1.ibd
+
+--echo # Read from the imported table.
+SELECT COUNT(*) FROM t1;
+
+--echo # Check that the read counters have been incremented.
+SELECT READ_REQS, READ_BYTES FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t1%';
+
+--echo # Check that statistics are not lost on rename.
+RENAME TABLE t1 TO t3;
+
+SELECT READ_REQS, READ_BYTES FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t3%';
+
+--echo # Trigger a write operation to the tablespace.
+INSERT INTO t3 VALUES (0, REPEAT('b', 512));
+
+--echo # Wait for tablespace to be flushed.
+let $wait_condition=
+  SELECT COUNT(*) = 1 FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t3%' AND FLUSH_REQS > 0;
+--source include/wait_condition.inc
+
+--echo # Drop tables from the cache.
+DROP TABLE t2, t3;
+
+--echo # Dropped tables are removed from the cache.
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_SPACE_STATS
+  WHERE SPACE_NAME LIKE '%test/t%';
+
+SET GLOBAL innodb_file_per_table = @old_innodb_file_per_table;
